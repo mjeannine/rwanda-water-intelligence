@@ -1,0 +1,459 @@
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+library(DT)
+library(forecast)
+
+# --- Load and prepare data ---
+customers <- read.csv("data/raw/dim_customers.csv")
+billing <- read.csv("data/raw/fact_consumption_billing.csv")
+
+billing_full <- billing %>%
+  left_join(customers, by = "Customer_ID")
+
+# --- Flag anomalies once, up front ---
+high_threshold <- quantile(billing_full$Consumption_m3[billing_full$Consumption_m3 >= 0], 0.995, na.rm = TRUE)
+
+anomalies_df <- billing_full %>%
+  mutate(
+    Anomaly_Type = case_when(
+      Consumption_m3 < 0 ~ "Invalid Reading",
+      Consumption_m3 == 0 & Amount_Billed_RWF > 0 ~ "Zero Consumption, Still Billed",
+      Amount_Paid_RWF > Amount_Billed_RWF ~ "Overpayment",
+      Consumption_m3 > high_threshold ~ "Extremely High Consumption",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Anomaly_Type))
+
+# --- Forecasting: prepare the monthly time series once, up front ---
+monthly_ts_data <- billing_full %>%
+  group_by(Month) %>%
+  summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+  arrange(Month)
+
+consumption_ts <- ts(monthly_ts_data$total_consumption, start = c(2024, 1), frequency = 12)
+
+# Train/test split: hide the last 4 months to check model accuracy honestly
+train_ts <- window(consumption_ts, end = c(2025, 8))
+test_ts <- window(consumption_ts, start = c(2025, 9))
+
+naive_fc <- naive(train_ts, h = length(test_ts))
+ets_fc <- forecast(ets(train_ts), h = length(test_ts))
+
+naive_acc <- accuracy(naive_fc, test_ts)
+ets_acc <- accuracy(ets_fc, test_ts)
+
+model_comparison <- data.frame(
+  Model = c("Naive", "ETS"),
+  RMSE = round(c(naive_acc["Test set", "RMSE"], ets_acc["Test set", "RMSE"]), 0),
+  MAE = round(c(naive_acc["Test set", "MAE"], ets_acc["Test set", "MAE"]), 0)
+)
+
+# Final production forecast: use ALL 24 months, predict next 6
+final_model <- ets(consumption_ts)
+final_forecast <- forecast(final_model, h = 6)
+
+historical_df <- data.frame(
+  Month = as.Date(paste0(monthly_ts_data$Month, "-01")),
+  Value = monthly_ts_data$total_consumption
+)
+
+future_months <- seq(max(historical_df$Month) + months(1), by = "month", length.out = 6)
+
+forecast_df <- data.frame(
+  Month = future_months,
+  Value = as.numeric(final_forecast$mean),
+  Lower = as.numeric(final_forecast$lower[, 2]),
+  Upper = as.numeric(final_forecast$upper[, 2])
+)
+
+# --- UI: what it looks like ---
+ui <- dashboardPage(
+
+  dashboardHeader(
+    title = tags$span(
+      tags$img(src = "logo.svg", height = "30px", style = "margin-right:8px;"),
+      "AquaRwanda"
+    ),
+    titleWidth = 280,
+
+    tags$li(
+      class = "dropdown",
+      style = "padding: 8px 15px;",
+      textInput("global_search", label = NULL, placeholder = "Search...", width = "180px")
+    ),
+
+    tags$li(
+      class = "dropdown",
+      actionLink("settings_btn", label = "", icon = icon("gear"), style = "padding: 15px;")
+    )
+  ),
+
+  dashboardSidebar(
+    width = 280,
+    sidebarMenu(
+      menuItem("Overview", tabName = "overview", icon = icon("chart-column")),
+      menuItem("Billing & Revenue", tabName = "billing", icon = icon("money-bill")),
+      menuItem("Anomalies", tabName = "anomalies", icon = icon("triangle-exclamation")),
+      menuItem("Forecasting", tabName = "forecasting", icon = icon("chart-line"))
+    )
+  ),
+
+  dashboardBody(
+    tabItems(
+
+      # ---- Overview page ----
+      tabItem(tabName = "overview",
+
+        fluidRow(
+          column(
+            width = 12,
+            p(
+              "A snapshot of water consumption, revenue, and customer activity across Kigali. Use the district filter below to explore a specific area.",
+              style = "color: #555; margin-bottom: 15px;"
+            )
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "District", width = 12, status = "primary", solidHeader = TRUE,
+            selectInput(
+              inputId = "district_filter",
+              label = NULL,
+              choices = c("All", sort(unique(customers$District)))
+            )
+          )
+        ),
+
+        fluidRow(
+          valueBoxOutput("total_customers_box", width = 3),
+          valueBoxOutput("total_consumption_box", width = 3),
+          valueBoxOutput("total_revenue_box", width = 3),
+          valueBoxOutput("collection_rate_box", width = 3)
+        ),
+
+        fluidRow(
+          box(
+            title = "Monthly Water Consumption", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("consumption_trend_plot", height = "260px")
+          ),
+          box(
+            title = "Consumption by Customer Type", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("customer_type_plot", height = "260px")
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "Total Consumption by District", width = 12, status = "primary", solidHeader = TRUE,
+            plotOutput("district_plot", height = "260px")
+          )
+        )
+      ),
+
+      # ---- Billing & Revenue page ----
+      tabItem(tabName = "billing",
+
+        fluidRow(
+          column(
+            width = 12,
+            p(
+              "Revenue and payment behavior across districts, customer types, and time. This page uses the same District filter as the Overview page.",
+              style = "color: #555; margin-bottom: 15px;"
+            )
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "Revenue Trend Over Time", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("revenue_trend_plot", height = "260px")
+          ),
+          box(
+            title = "Revenue by District", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("revenue_district_plot", height = "260px")
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "Revenue by Customer Type", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("revenue_customer_type_plot", height = "260px")
+          ),
+          box(
+            title = "Payment Status Breakdown", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("payment_status_plot", height = "260px")
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "Consumption vs Revenue", width = 12, status = "primary", solidHeader = TRUE,
+            plotOutput("consumption_vs_revenue_plot", height = "300px")
+          )
+        )
+      ),
+
+      # ---- Anomalies page ----
+      tabItem(tabName = "anomalies",
+
+        fluidRow(
+          column(
+            width = 12,
+            p(
+              "Records flagged for data quality review. An anomaly here means the numbers don't quite add up - it doesn't automatically mean fraud or error.",
+              style = "color: #555; margin-bottom: 15px;"
+            )
+          )
+        ),
+
+        fluidRow(
+          valueBoxOutput("anomaly_invalid_box", width = 3),
+          valueBoxOutput("anomaly_zero_box", width = 3),
+          valueBoxOutput("anomaly_overpay_box", width = 3),
+          valueBoxOutput("anomaly_high_box", width = 3)
+        ),
+
+        fluidRow(
+          box(
+            title = "Flagged Records", width = 12, status = "primary", solidHeader = TRUE,
+            DTOutput("anomalies_table")
+          )
+        )
+      ),
+
+      # ---- Forecasting page ----
+      tabItem(tabName = "forecasting",
+
+        fluidRow(
+          column(
+            width = 12,
+            p(
+              "A 6-month water demand forecast based on 24 months of historical consumption. With this little history, treat the forecast as a directional estimate, not a guarantee.",
+              style = "color: #555; margin-bottom: 15px;"
+            )
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "Model Comparison (Validation on Last 4 Months)", width = 12, status = "primary", solidHeader = TRUE,
+            tableOutput("model_comparison_table"),
+            p("Lower RMSE and MAE mean better accuracy. The model with the lower error is used for the forecast below.",
+              style = "color: #777; font-size: 13px;")
+          )
+        ),
+
+        fluidRow(
+          box(
+            title = "6-Month Water Demand Forecast", width = 12, status = "primary", solidHeader = TRUE,
+            plotOutput("forecast_plot", height = "320px")
+          )
+        )
+      )
+    )
+  )
+)
+
+# --- Server: what it does ---
+server <- function(input, output, session) {
+
+  filtered_billing <- reactive({
+    if (input$district_filter == "All") {
+      billing_full
+    } else {
+      billing_full %>% filter(District == input$district_filter)
+    }
+  })
+
+  filtered_customers <- reactive({
+    if (input$district_filter == "All") {
+      customers
+    } else {
+      customers %>% filter(District == input$district_filter)
+    }
+  })
+
+  # --- Overview KPI cards ---
+  output$total_customers_box <- renderValueBox({
+    valueBox(
+      value = format(n_distinct(filtered_customers()$Customer_ID), big.mark = ","),
+      subtitle = "Total Customers",
+      icon = icon("users"), color = "blue"
+    )
+  })
+
+  output$total_consumption_box <- renderValueBox({
+    total <- sum(filtered_billing()$Consumption_m3, na.rm = TRUE)
+    valueBox(
+      value = paste0(format(round(total), big.mark = ","), " m3"),
+      subtitle = "Total Consumption",
+      icon = icon("droplet"), color = "light-blue"
+    )
+  })
+
+  output$total_revenue_box <- renderValueBox({
+    total <- sum(filtered_billing()$Amount_Paid_RWF, na.rm = TRUE)
+    valueBox(
+      value = paste0(format(round(total), big.mark = ","), " RWF"),
+      subtitle = "Total Revenue Collected",
+      icon = icon("sack-dollar"), color = "olive"
+    )
+  })
+
+  output$collection_rate_box <- renderValueBox({
+    billed <- sum(filtered_billing()$Amount_Billed_RWF, na.rm = TRUE)
+    paid <- sum(filtered_billing()$Amount_Paid_RWF, na.rm = TRUE)
+    rate <- round(100 * paid / billed, 1)
+    valueBox(
+      value = paste0(rate, "%"),
+      subtitle = "Collection Rate",
+      icon = icon("gauge-high"), color = "teal"
+    )
+  })
+
+  # --- Overview charts ---
+  output$consumption_trend_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Month) %>%
+      summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+      ggplot(aes(x = Month, y = total_consumption, group = 1)) +
+      geom_line(color = "steelblue", linewidth = 1) +
+      geom_point(color = "steelblue", size = 2) +
+      labs(y = "Total Consumption (m3)", x = "Month") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$customer_type_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Customer_Type) %>%
+      summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+      ggplot(aes(x = Customer_Type, y = total_consumption)) +
+      geom_col(fill = "steelblue") +
+      labs(y = "Total Consumption (m3)", x = "")
+  })
+
+  output$district_plot <- renderPlot({
+    billing_full %>%
+      group_by(District) %>%
+      summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+      ggplot(aes(x = District, y = total_consumption)) +
+      geom_col(fill = "steelblue") +
+      labs(y = "Total Consumption (m3)", x = "")
+  })
+
+  # --- Billing & Revenue charts ---
+  output$revenue_trend_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Month) %>%
+      summarise(total_revenue = sum(Amount_Paid_RWF, na.rm = TRUE)) %>%
+      ggplot(aes(x = Month, y = total_revenue, group = 1)) +
+      geom_line(color = "seagreen", linewidth = 1) +
+      geom_point(color = "seagreen", size = 2) +
+      labs(y = "Total Revenue (RWF)", x = "Month") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$revenue_district_plot <- renderPlot({
+    billing_full %>%
+      group_by(District) %>%
+      summarise(total_revenue = sum(Amount_Paid_RWF, na.rm = TRUE)) %>%
+      ggplot(aes(x = District, y = total_revenue)) +
+      geom_col(fill = "seagreen") +
+      labs(y = "Total Revenue (RWF)", x = "")
+  })
+
+  output$revenue_customer_type_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Customer_Type) %>%
+      summarise(total_revenue = sum(Amount_Paid_RWF, na.rm = TRUE)) %>%
+      ggplot(aes(x = Customer_Type, y = total_revenue)) +
+      geom_col(fill = "seagreen") +
+      labs(y = "Total Revenue (RWF)", x = "")
+  })
+
+  output$payment_status_plot <- renderPlot({
+    filtered_billing() %>%
+      count(Payment_Status) %>%
+      ggplot(aes(x = Payment_Status, y = n)) +
+      geom_col(fill = "seagreen") +
+      labs(y = "Number of Bills", x = "")
+  })
+
+  output$consumption_vs_revenue_plot <- renderPlot({
+    plot_data <- filtered_billing()
+    if (nrow(plot_data) > 2000) {
+      plot_data <- plot_data %>% slice_sample(n = 2000)
+    }
+    plot_data %>%
+      ggplot(aes(x = Consumption_m3, y = Amount_Paid_RWF)) +
+      geom_point(color = "seagreen", alpha = 0.3) +
+      labs(x = "Consumption (m3)", y = "Amount Paid (RWF)")
+  })
+
+  # --- Anomalies page ---
+  filtered_anomalies <- reactive({
+    if (input$district_filter == "All") {
+      anomalies_df
+    } else {
+      anomalies_df %>% filter(District == input$district_filter)
+    }
+  })
+
+  output$anomaly_invalid_box <- renderValueBox({
+    n <- sum(filtered_anomalies()$Anomaly_Type == "Invalid Reading")
+    valueBox(value = format(n, big.mark = ","), subtitle = "Invalid Readings", icon = icon("triangle-exclamation"), color = "red")
+  })
+
+  output$anomaly_zero_box <- renderValueBox({
+    n <- sum(filtered_anomalies()$Anomaly_Type == "Zero Consumption, Still Billed")
+    valueBox(value = format(n, big.mark = ","), subtitle = "Zero Consumption, Billed", icon = icon("circle-exclamation"), color = "orange")
+  })
+
+  output$anomaly_overpay_box <- renderValueBox({
+    n <- sum(filtered_anomalies()$Anomaly_Type == "Overpayment")
+    valueBox(value = format(n, big.mark = ","), subtitle = "Overpayments", icon = icon("hand-holding-dollar"), color = "yellow")
+  })
+
+  output$anomaly_high_box <- renderValueBox({
+    n <- sum(filtered_anomalies()$Anomaly_Type == "Extremely High Consumption")
+    valueBox(value = format(n, big.mark = ","), subtitle = "Extreme Consumption", icon = icon("arrow-trend-up"), color = "maroon")
+  })
+
+  output$anomalies_table <- renderDT({
+    filtered_anomalies() %>%
+      select(Customer_ID, Month, District, Customer_Type, Consumption_m3,
+             Amount_Billed_RWF, Amount_Paid_RWF, Anomaly_Type) %>%
+      datatable(options = list(pageLength = 10), rownames = FALSE)
+  })
+
+  # --- Forecasting page ---
+  output$model_comparison_table <- renderTable({
+    model_comparison
+  })
+
+  output$forecast_plot <- renderPlot({
+    ggplot() +
+      geom_line(data = historical_df, aes(x = Month, y = Value), color = "steelblue", linewidth = 1) +
+      geom_point(data = historical_df, aes(x = Month, y = Value), color = "steelblue", size = 2) +
+      geom_ribbon(data = forecast_df, aes(x = Month, ymin = Lower, ymax = Upper), fill = "darkorange", alpha = 0.2) +
+      geom_line(data = forecast_df, aes(x = Month, y = Value), color = "darkorange", linetype = "dashed", linewidth = 1) +
+      geom_point(data = forecast_df, aes(x = Month, y = Value), color = "darkorange", size = 2) +
+      labs(y = "Total Consumption (m3)", x = "Month") +
+      scale_x_date(date_labels = "%Y-%m", date_breaks = "2 months") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  # --- Settings placeholder ---
+  observeEvent(input$settings_btn, {
+    showModal(modalDialog(
+      title = "Settings",
+      "Settings options are coming soon.",
+      easyClose = TRUE
+    ))
+  })
+}
+
+shinyApp(ui = ui, server = server)

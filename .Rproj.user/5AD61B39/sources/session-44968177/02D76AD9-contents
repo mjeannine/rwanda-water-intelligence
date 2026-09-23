@@ -1,0 +1,182 @@
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+
+# --- Load and prepare data ---
+customers <- read.csv("data/raw/dim_customers.csv")
+billing <- read.csv("data/raw/fact_consumption_billing.csv")
+
+billing_full <- billing %>%
+  left_join(customers, by = "Customer_ID")
+
+# --- UI: what it looks like ---
+ui <- dashboardPage(
+
+  dashboardHeader(
+    title = tags$span(
+      tags$img(src = "logo.svg", height = "30px", style = "margin-right:8px;"),
+      "AquaRwanda"
+    ),
+    titleWidth = 280,
+
+    # Search box (placeholder for now - not wired to anything yet)
+    tags$li(
+      class = "dropdown",
+      style = "padding: 8px 15px;",
+      textInput("global_search", label = NULL, placeholder = "Search...", width = "180px")
+    ),
+
+    # Settings gear icon (shows a simple placeholder popup for now)
+    tags$li(
+      class = "dropdown",
+      actionLink("settings_btn", label = "", icon = icon("gear"), style = "padding: 15px;")
+    )
+  ),
+
+  dashboardSidebar(
+    width = 280,
+    sidebarMenu(
+      menuItem("Overview", tabName = "overview", icon = icon("chart-column")),
+      menuItem("Billing & Revenue", tabName = "billing", icon = icon("money-bill")),
+      menuItem("Anomalies", tabName = "anomalies", icon = icon("triangle-exclamation")),
+      menuItem("Forecasting", tabName = "forecasting", icon = icon("chart-line"))
+    )
+  ),
+
+  dashboardBody(
+    tabItems(
+
+      # ---- Overview page ----
+      tabItem(tabName = "overview",
+
+        fluidRow(
+          box(
+            title = "View by District", width = 12, status = "primary", solidHeader = TRUE,
+            selectInput(
+              inputId = "district_filter",
+              label = NULL,
+              choices = c("All", sort(unique(customers$District)))
+            )
+          )
+        ),
+
+        fluidRow(
+          valueBoxOutput("total_customers_box", width = 3),
+          valueBoxOutput("total_consumption_box", width = 3),
+          valueBoxOutput("total_revenue_box", width = 3),
+          valueBoxOutput("collection_rate_box", width = 3)
+        ),
+
+        fluidRow(
+          box(
+            title = "Monthly Water Consumption", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("consumption_trend_plot")
+          ),
+          box(
+            title = "Consumption by Customer Type", width = 6, status = "primary", solidHeader = TRUE,
+            plotOutput("customer_type_plot")
+          )
+        )
+      ),
+
+      # ---- Placeholder pages for upcoming phases ----
+      tabItem(tabName = "billing", h3("Billing & Revenue — coming soon")),
+      tabItem(tabName = "anomalies", h3("Anomaly Detection — coming soon")),
+      tabItem(tabName = "forecasting", h3("Forecasting — coming soon"))
+    )
+  )
+)
+
+# --- Server: what it does ---
+server <- function(input, output, session) {
+
+  # Reactive: filtered billing data (changes whenever the district dropdown changes)
+  filtered_billing <- reactive({
+    if (input$district_filter == "All") {
+      billing_full
+    } else {
+      billing_full %>% filter(District == input$district_filter)
+    }
+  })
+
+  # Reactive: filtered customer list (for the customer count KPI)
+  filtered_customers <- reactive({
+    if (input$district_filter == "All") {
+      customers
+    } else {
+      customers %>% filter(District == input$district_filter)
+    }
+  })
+
+  # --- KPI cards ---
+  output$total_customers_box <- renderValueBox({
+    valueBox(
+      value = format(n_distinct(filtered_customers()$Customer_ID), big.mark = ","),
+      subtitle = "Total Customers",
+      icon = icon("users"), color = "blue"
+    )
+  })
+
+  output$total_consumption_box <- renderValueBox({
+    total <- sum(filtered_billing()$Consumption_m3, na.rm = TRUE)
+    valueBox(
+      value = paste0(format(round(total), big.mark = ","), " m3"),
+      subtitle = "Total Consumption",
+      icon = icon("droplet"), color = "teal"
+    )
+  })
+
+  output$total_revenue_box <- renderValueBox({
+    total <- sum(filtered_billing()$Amount_Paid_RWF, na.rm = TRUE)
+    valueBox(
+      value = paste0(format(round(total), big.mark = ","), " RWF"),
+      subtitle = "Total Revenue Collected",
+      icon = icon("sack-dollar"), color = "green"
+    )
+  })
+
+  output$collection_rate_box <- renderValueBox({
+    billed <- sum(filtered_billing()$Amount_Billed_RWF, na.rm = TRUE)
+    paid <- sum(filtered_billing()$Amount_Paid_RWF, na.rm = TRUE)
+    rate <- round(100 * paid / billed, 1)
+    valueBox(
+      value = paste0(rate, "%"),
+      subtitle = "Collection Rate",
+      icon = icon("gauge-high"), color = "purple"
+    )
+  })
+
+  # --- Charts ---
+  output$consumption_trend_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Month) %>%
+      summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+      ggplot(aes(x = Month, y = total_consumption, group = 1)) +
+      geom_line(color = "steelblue", linewidth = 1) +
+      geom_point(color = "steelblue", size = 2) +
+      labs(y = "Total Consumption (m3)", x = "Month") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$customer_type_plot <- renderPlot({
+    filtered_billing() %>%
+      group_by(Customer_Type) %>%
+      summarise(total_consumption = sum(Consumption_m3, na.rm = TRUE)) %>%
+      ggplot(aes(x = Customer_Type, y = total_consumption, fill = Customer_Type)) +
+      geom_col() +
+      labs(y = "Total Consumption (m3)", x = "") +
+      theme(legend.position = "none")
+  })
+
+  # --- Settings placeholder ---
+  observeEvent(input$settings_btn, {
+    showModal(modalDialog(
+      title = "Settings",
+      "Settings options are coming soon.",
+      easyClose = TRUE
+    ))
+  })
+}
+
+# --- Combine and launch ---
+shinyApp(ui = ui, server = server)
