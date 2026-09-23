@@ -1,0 +1,8 @@
+# Data files - not published to keep the repo lightweight and data private
+data/raw/*.csv
+
+# R / RStudio housekeeping files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
